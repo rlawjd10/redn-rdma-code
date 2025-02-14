@@ -44,6 +44,16 @@ enum region_type {
 	MR_COUNT
 };
 
+enum sock_type {
+	SOCK_MASTER = 2,
+	SOCK_CLIENT,
+	SOCK_WORKER
+};
+
+int master_sock = 0;
+int client_sock = 2;
+int worker_sock = 3;
+
 struct mr_context regions[MR_COUNT];
 
 char *portno = "12345";
@@ -95,6 +105,7 @@ int main(int argc, char **argv) {
     
     int iters;
 
+
     // check parameter
     if (argc != 1 && argc != 3) {
         fprintf(stderr, "usage: %s <peer-address> <iters> [-p <portno>] [-e <sge count>] [-b <batch size>]  (note: run without args to use as server)\n", argv[0]);
@@ -103,21 +114,28 @@ int main(int argc, char **argv) {
 
     if (argc > 1) { isClient = 1; }
 
-    if (isClient) {
-        iters = atoi(argv[2]);
-        
-        if (iters > OFFLOAD_COUNT) {
-            return 1;
-        }
-    }
-
     // allocate dram region
     if (allocate_physical_memory(BUFFER_SIZE) == NULL) {
         fprintf(stderr, "Failed to allocate hugepage memory\n");
         return EXIT_FAILURE;
     }
 
-    // rdma connection
+    if (isClient) {
+        iters = atoi(argv[2]);
+        char *server_ip = atoi(argv[1]);
+        
+        if (iters > OFFLOAD_COUNT) {
+            return 1;
+        }
+        
+        // sockfd를 반환
+        master_sock = add_connection(server_ip, portno, SOCK_MASTER, 1, 0);
+    }
+
+    // rdma connection (server & client)
     init_rdma_agent(portno, regions, MR_COUNT, 2, NULL, NULL, NULL);
+
+    printf("Starting benchmark ...\n");
+
 
 }
