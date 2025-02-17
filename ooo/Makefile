@@ -59,7 +59,7 @@ $(BUILD_DIR):
 # 라이브러리(librdma) 타겟 
 librdma: $(OBJ) $(OBJCPP)
 	ar cr build/librdma.a $(OBJ) $(OBJCPP)
-	$(CC) -shared $(DEBUG) -o build/librdma.so $(OBJ) $(OBJCPP) $(LD_FLAGS) $(LDLIBS)
+	$(CC) -shared $(DEBUG) -o build/librdma.so $(OBJ) $(OBJCPP) $(LDFLAGS) $(LDLIBS)
 
 $(foreach bdir,$(BUILD_DIR),$(eval $(call make-goal,$(bdir))))
 

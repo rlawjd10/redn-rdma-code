@@ -9,7 +9,6 @@
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <inttypes.h>
-#include "time_stat.h"
 #include "agent.h"
 
 #define OFFLOAD_COUNT 50000
@@ -75,7 +74,7 @@ pthread_spinlock_t sock_lock;
 int isClient = 0;
 typedef uintptr_t addr_t;
 
-unit64_t A[3] = {0, 1, 2};  
+uint64_t A[3] = {0, 1, 2};  
 
 
 void *allocate_physical_memory(size_t size) {
@@ -248,7 +247,9 @@ void test_callback(struct app_context *msg)
 
 
 
-
+void *offload_hash(void *arg) {
+    ;
+}
 
 
 
@@ -296,7 +297,7 @@ int main(int argc, char **argv) {
 
     if (isClient) {
         iters = atoi(argv[2]);
-        char *server_ip = atoi(argv[1]);
+        char *server_ip = argv[1];
         
         if (iters > OFFLOAD_COUNT) {
             return 1;
