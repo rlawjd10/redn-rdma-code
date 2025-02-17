@@ -398,7 +398,7 @@ void IBV_NOOP_SYNC(int sockfd, int signaled)
 // receive operations 
 void IBV_RECEIVE_IMM(int sockfd)    // immediate data 수신 
 {
-	struct rdma_cm_id *id = get_connection(sockfd);
+	struct rdma_cm_id *id = get_connection(sockfd);	// scokfd를 통해 bitmap에서 id 찾기 
 	receive_imm(id, 0);
 }
 
@@ -821,7 +821,7 @@ void receive_imm(struct rdma_cm_id *id, int buffer)
 	memset(&wr, 0, sizeof(wr));
 
 	wr.wr_id = buffer;
-	wr.sg_list = NULL;
+	wr.sg_list = NULL;	// immediate 수신에서는 SGE가 필요없어서 NULL로 설정
 	wr.num_sge = 0;
 
 	//debug_print("POST --> RECV-IMM (WR #%lu) [send_fd %d]\n", wr.wr_id, ctx->sockfd);

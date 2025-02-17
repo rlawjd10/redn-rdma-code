@@ -38,6 +38,7 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 	if(listen_port)
 		snprintf(port, sizeof(port), "%s", listen_port);
 
+	// event기반 callback함수들 handling하기 위함 
 	rc_init(on_pre_conn,
 		on_connection,
 		on_completion,
