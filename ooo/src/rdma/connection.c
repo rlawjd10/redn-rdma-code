@@ -867,7 +867,7 @@ int rc_bind_buffer(struct rdma_cm_id *id, int buffer, uint32_t wr_id)	// 버퍼�
 	struct conn_context *ctx = (struct conn_context *) id->context;
 
 	// send buffer ownership
-	struct bufferbu_record *rec = calloc(1, sizeof(struct buffer_record));
+	struct buffer_record *rec = calloc(1, sizeof(struct buffer_record));
 	rec->wr_id = wr_id;
 	rec->buff_id = buffer;
 

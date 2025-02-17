@@ -83,7 +83,7 @@ static inline void mlx5_write64(uint32_t val[2],
 				void *dest,
 				pthread_spinlock_t *lock)
 {
-	pthread_spinlock_t(lock);
+	pthread_spin_lock(lock);
 	*(volatile uint32_t *)dest		= val[0];
 	*(volatile uint32_t *)(dest + 4)	= val[1];
 	pthread_spin_unlock(lock);
