@@ -51,7 +51,7 @@ int init_connection(struct rdma_cm_id *id, int type, int always_poll, int flags)
 	if(sockfd < 0)
 		rc_die("can't open new connection; number of open sockets == MAX_CONNECTIONS");
 
-	//debug_print("adding connection on socket #%d\n", sockfd);
+	debug_print("adding connection on socket #%d\n", sockfd);
 
 	struct conn_context *ctx = (struct conn_context *)calloc(1, sizeof(struct conn_context)); // 104 bytes	
     ctx->local_mr = (struct ibv_mr **)calloc(MAX_MR, sizeof(struct ibv_mr*));               // 8 bytes * 2 = 16 bytes
@@ -319,26 +319,29 @@ void rdma_event_loop(struct rdma_event_channel *ec, int exit_on_connect, int exi
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
 
+	debug_print("Listening for incoming connections...\n");
+
 	while (rdma_get_cm_event(ec, &event) == 0) {
 		struct rdma_cm_event event_copy;
 
 		memcpy(&event_copy, event, sizeof(*event));
-		//debug_print("received event[%d]: %s\n", event_copy.event, rdma_event_str(event_copy.event));
+		debug_print("received event[%d]: %s\n", event_copy.event, rdma_event_str(event_copy.event));
 
 		rdma_ack_cm_event(event);
 
+		// client
 		if (event_copy.event == RDMA_CM_EVENT_ADDR_RESOLVED) {
 			rdma_resolve_route(event_copy.id, TIMEOUT_IN_MS);
 		}
-		//client
-		else if (event_copy.event == RDMA_CM_EVENT_ROUTE_RESOLVED) {	
+		// client
+		else if (event_copy.event == RDMA_CM_EVENT_ROUTE_RESOLVED) {
 			setup_connection(event_copy.id, NULL);
 
-			if (s_on_pre_conn_cb) {
-				//debug_print("trigger pre-connection callback\n");
+			if (s_on_pre_conn_cb) {	// on_pre_conn (agent.c) callback 함수 호출 
+				debug_print("trigger pre-connection callback\n");
 				s_on_pre_conn_cb(event_copy.id);
 			}
-			// connecting to the server...
+
 			build_rc_params(event_copy.id, &cm_params);
 			if(rdma_connect(event_copy.id, &cm_params))
 				rc_die("failed to connect\n");
@@ -354,7 +357,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, int exit_on_connect, int exi
 			init_connection(event_copy.id, -1, always_poll, 0);
 			setup_connection(event_copy.id, &event_copy.param.conn);
 
-			if (s_on_pre_conn_cb) {
+			if (s_on_pre_conn_cb) {	//  on_pre_conn (agent.c)
 				//debug_print("trigger pre-connection callback\n");
 				s_on_pre_conn_cb(event_copy.id);
 			}
@@ -366,8 +369,8 @@ void rdma_event_loop(struct rdma_event_channel *ec, int exit_on_connect, int exi
 		else if (event_copy.event == RDMA_CM_EVENT_ESTABLISHED) {
 			finalize_connection(event_copy.id, &event_copy.param.conn);
 			
-			if (s_on_connect_cb) {
-				//debug_print("trigger post-connection callback\n");
+			if (s_on_connect_cb) {	// on_connection (agent.c) -> add_peer_socket (test.c)
+				debug_print("trigger post-connection callback\n");
 				s_on_connect_cb(event_copy.id);
 			}
 			if (exit_on_connect)
@@ -570,7 +573,7 @@ inline void poll_cq(struct ibv_cq *cq, struct ibv_wc *wc)
 	while(ibv_poll_cq(cq, 1, wc)) {
 		if (wc->status == IBV_WC_SUCCESS) {
 			update_completions(wc);
-			s_on_completion_cb(wc);
+			s_on_completion_cb(wc); // on_completion (agent.c)
 		}
 		else {
 #if 1
@@ -594,7 +597,7 @@ inline void poll_cq_debug(struct ibv_cq *cq, struct ibv_wc *wc)
 			update_completions(wc);
 
 			//debug_print("trigger completion callback\n");
-			s_on_completion_cb(wc);
+			s_on_completion_cb(wc); // on_completion (agent.c)
 
 			if(wc->opcode & IBV_WC_RECV)
 				return;
@@ -673,17 +676,15 @@ struct rdma_cm_id* get_connection(int sockfd)	// sockfd를 통해 연결 찾기
 /* ----- rc connection handling ----- */
 __attribute__((visibility ("hidden"))) // RDMA 연결 관리 모듈을 초기화 
 void rc_init(pre_conn_cb_fn pc, connect_cb_fn conn, completion_cb_fn comp, disconnect_cb_fn disc)
-{
-	debug_print("initializing RC module\n");
-	
+{	
 	s_conn_bitmap = calloc(MAX_CONNECTIONS, sizeof(int));
 	s_conn_ids = (struct rdma_cm_id **)calloc(MAX_CONNECTIONS, sizeof(struct rdma_cm_id*));
 
 	// call back function
-	s_on_pre_conn_cb = pc;	// 연결 전 콜백 함수
-	s_on_connect_cb = conn;	// 연결 후 콜백 함수
-	s_on_completion_cb = comp;	// 완료 콜백 함수
-	s_on_disconnect_cb = disc;	// 연결 해제 콜백 함수
+	s_on_pre_conn_cb = pc;	// 연결 전 콜백 함수 on_pre_conn
+	s_on_connect_cb = conn;	// 연결 후 콜백 함수 on_connection
+	s_on_completion_cb = comp;	// 완료 콜백 함수 on_completion
+	s_on_disconnect_cb = disc;	// 연결 해제 콜백 함수 on_disconnect
 }
 
 __attribute__((visibility ("hidden"))) 

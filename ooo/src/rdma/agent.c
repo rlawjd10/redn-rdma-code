@@ -45,6 +45,8 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 		on_disconnect);
 
 	ec = rdma_create_event_channel();
+	if (ec == NULL)
+		rc_die("failed to create event channel");
 
 	if(!listen_port)
 		pthread_create(&comm_thread, NULL, client_loop, NULL);
@@ -56,7 +58,6 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 
 //request connection to another RDMA agent (non-blocking)
 //returns socket descriptor if successful, otherwise -1
-// 클라이언트가 서버에 연결 
 int add_connection(char* ip, char *port, int app_type, int polling_loop, int flags) 
 {
 	debug_print("attempting to add connection to %s:%s\n", ip, port);
@@ -67,7 +68,9 @@ int add_connection(char* ip, char *port, int app_type, int polling_loop, int fla
 	struct addrinfo *addr;
 	struct rdma_cm_id *cm_id = NULL;
 
-	getaddrinfo(ip, port, NULL, &addr); // 서버의 IP, port 정보를 얻어옴 
+	getaddrinfo(ip, port, NULL, &addr); 
+
+	rdma_create_event_channel();
 
 	rdma_create_id(ec, &cm_id, NULL, RDMA_PS_TCP);
 	rdma_resolve_addr(cm_id, NULL, addr->ai_addr, TIMEOUT_IN_MS);
@@ -85,15 +88,10 @@ int add_connection(char* ip, char *port, int app_type, int polling_loop, int fla
 static void on_pre_conn(struct rdma_cm_id *id)
 {
 	struct conn_context *ctx = (struct conn_context *)id->context;
-
-	// if no MRs provided, trigger registeration callback
-	//if(mrs == NULL)
     
     debug_print("mrs: %p, num_mrs: %d, msg_size: %d\n", mrs, num_mrs, msg_size);
+	
 	mr_register(ctx, mrs, num_mrs, msg_size);
-
-	//for(int i=0; i<MAX_BUFFER; i++)
-	//	receive_message(id, 0);
 }
 
 static void on_connection(struct rdma_cm_id *id)
@@ -102,15 +100,14 @@ static void on_connection(struct rdma_cm_id *id)
 
 	printf("Connection established [sockfd:%d] [qpnum: %d]\n", ctx->sockfd, id->qp->qp_num);
 
-	app_conn_event(ctx->sockfd);
+	app_conn_event(ctx->sockfd);	// add_peer_socket 호출 
 }
 
 static void on_disconnect(struct rdma_cm_id *id)
 {
 	struct conn_context *ctx = (struct conn_context *)id->context;
-	app_disc_event(ctx->sockfd);
+	app_disc_event(ctx->sockfd);	// remove_peer_socket 호출 
 	printf("Connection terminated [sockfd:%d]\n", ctx->sockfd);
-	//free(ctx);
 }
 
 static void on_completion(struct ibv_wc *wc)
@@ -131,7 +128,7 @@ static void on_completion(struct ibv_wc *wc)
 				imm_msg.id = app_id;
 				imm_msg.sockfd = ctx->sockfd;
 				imm_msg.data = 0;
-				app_recv_event(&imm_msg);
+				app_recv_event(&imm_msg);	//test_callback 호출 
 				return;
 			//}
 		}
@@ -155,20 +152,24 @@ static void* client_loop()
 
 static void* server_loop(void *port)
 {
-	struct sockaddr_in6 addr;
+	struct sockaddr_in addr;
 	struct rdma_cm_id *cm_id = NULL;
 
 	memset(&addr, 0, sizeof(addr));
-	addr.sin6_family = AF_INET6;
-	addr.sin6_port = htons(atoi(port));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(atoi(port));
+	addr.sin_addr.s_addr = INADDR_ANY;
 
 	rdma_create_id(ec, &cm_id, NULL, RDMA_PS_TCP);
 	rdma_bind_addr(cm_id, (struct sockaddr *)&addr);
 	rdma_listen(cm_id, 100); /* backlog=10 is arbitrary */
 
 	printf("[RDMA-Server] Listening on port %d for connections. interrupt (^C) to exit.\n", atoi(port));
-
-	rdma_event_loop(ec, 0, 0); /* do not exit upon disconnect */
+	
+	while (1) {
+		rdma_event_loop(ec, 0, 0); /* do not exit upon disconnect */
+		// 종료조건 -> main에서 SIGINT 발생시 종료 
+	}
 
 	rdma_destroy_id(cm_id);
 	rdma_destroy_event_channel(ec);
