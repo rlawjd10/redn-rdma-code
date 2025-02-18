@@ -7,6 +7,8 @@
 #include "mr.h"
 #include "agent.h"
 
+pthread_t comm_thread;
+
 int rdma_initialized = 0;
 char port[10];
 

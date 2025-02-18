@@ -10,7 +10,7 @@ static app_conn_cb_fn app_conn_event;
 static app_disc_cb_fn app_disc_event;
 static app_recv_cb_fn app_recv_event;
 
-static pthread_t comm_thread;
+extern pthread_t comm_thread;
 
 extern int rdma_initialized;
 extern char port[10];
