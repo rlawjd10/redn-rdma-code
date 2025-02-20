@@ -16,7 +16,7 @@ extern int rdma_initialized;
 extern char port[10];
 
 void init_rdma_agent(char *listen_port, struct mr_context *regions,
-		int region_count, uint16_t buffer_size,
+		int region_count, uint16_t buffer_size, int is_client,
 		app_conn_cb_fn conn_callback,
 		app_disc_cb_fn disc_callback,
 		app_recv_cb_fn recv_callback);

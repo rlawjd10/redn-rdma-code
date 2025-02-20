@@ -14,7 +14,7 @@ char port[10];
 
 //initialize memory region information
 void init_rdma_agent(char *listen_port, struct mr_context *regions,
-		int region_count, uint16_t buffer_size,
+		int region_count, uint16_t buffer_size, int is_client,
 		app_conn_cb_fn app_connect,
 		app_disc_cb_fn app_disconnect,
 		app_recv_cb_fn app_receive)
@@ -38,7 +38,7 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 	set_seed(5);
 
 	if(listen_port)
-		snprintf(port, sizeof(port), "%s", listen_port);
+		snprintf(port, sizeof(port), "%s", listen_port); 
 
 	// event기반 callback함수들 handling하기 위함 
 	rc_init(on_pre_conn,
@@ -50,7 +50,8 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 	if (ec == NULL)
 		rc_die("failed to create event channel");
 
-	if(!listen_port)
+	// create a new RDMA communication identifier 
+	if(is_client)
 		pthread_create(&comm_thread, NULL, client_loop, NULL);
 	else
 		pthread_create(&comm_thread, NULL, server_loop, port);
@@ -146,6 +147,7 @@ static void on_completion(struct ibv_wc *wc)
 // client&server event loop
 static void* client_loop()
 {
+	printf("[RDMA-Client] Listening for incoming connections. interrupt (^C) to exit.\n");
 	rdma_event_loop(ec, 0, 1); /* exit upon disconnect */
 	rdma_destroy_event_channel(ec);
 	debug_print("exiting rc_client_loop\n");
