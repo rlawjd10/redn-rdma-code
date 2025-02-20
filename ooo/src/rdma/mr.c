@@ -75,10 +75,10 @@ int mr_remote_ready(struct conn_context *ctx, int mr_id)
 __attribute__((visibility ("hidden"))) 
 void mr_register(struct conn_context *ctx, struct mr_context *mrs, int num_mrs, int msg_size)
 {
-	// debug_print("[sockfd %d] registering %d memory regions & %d send/rcv buffers\n", ctx->sockfd, num_mrs, MAX_BUFFER*2);
+	debug_print("[sockfd %d] registering %d memory regions & %d send/rcv buffers\n", ctx->sockfd, num_mrs, MAX_BUFFER*2);
 
 	int idx = 0;
-	// mr 개수만큼 반복해서 메모리 등록 
+	// num_mrs만큼의 mr 등록 (data buffer) 
 	for(int i=0; i<num_mrs; i++) {
 		//debug_print("registering mr #%d with addr:%lu and size:%lu\n", i, mrs[i].addr, mrs[i].length);
 		//int idx = mrs[i].type;
@@ -119,10 +119,11 @@ void mr_register(struct conn_context *ctx, struct mr_context *mrs, int num_mrs, 
 	ctx->local_mr_to_sync = find_first_set_bit(ctx->local_mr_ready, MAX_MR);
 
 	printf("Registering msg buffers with size: %lu\n", sizeof(struct message) + sizeof(char)*msg_size);
-	for(int i=0; i<MAX_BUFFER; i++) {
+	for(int i=0; i<MAX_BUFFER; i++) { // MAX_BUFFER = 1
 		//ctx->msg_send[i] = (struct message*) calloc(1, sizeof(struct message));
 		//ctx->msg_rcv[i] = (struct message*) calloc(1, sizeof(struct message));
 
+		// #1 송신용 
 		if(posix_memalign((void **)&ctx->msg_send[i], sysconf(_SC_PAGESIZE), sizeof(*ctx->msg_send[i])+sizeof(char)*msg_size))
 			rc_die("posix_memalign failed");
 
@@ -135,10 +136,10 @@ void mr_register(struct conn_context *ctx, struct mr_context *mrs, int num_mrs, 
 		debug_print("registered msg_send_mr[addr:%lx, len:%lu]\n",
 				(uintptr_t)ctx->msg_send_mr[i]->addr, ctx->msg_send_mr[i]->length);
 
+		// #2 수신용 
 		if(posix_memalign((void **)&ctx->msg_rcv[i], sysconf(_SC_PAGESIZE), sizeof(*ctx->msg_rcv[i])+sizeof(char)*msg_size))
 			rc_die("posix_memalign failed");
-
-		// 메시지 송수신을 위한 버퍼 등록 
+ 
 		ctx->msg_rcv_mr[i] = ibv_reg_mr(rc_get_pd(ctx->id), ctx->msg_rcv[i], (sizeof(*ctx->msg_rcv[i])+sizeof(char)*msg_size),
 				IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 
