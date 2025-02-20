@@ -228,13 +228,16 @@ restart:
 int main(int argc, char **argv) {
 
     int shm_fd, shm_ret;
-    
     char *server_ip = argv[1];
+    void *addr;
 
+    // 1. timer 설정 
+    ////////////////
     int *shm_proc = (int*)create_shm(&shm_fd, &shm_ret);
 
     pthread_spin_init(&sock_lock, PTHREAD_PROCESS_PRIVATE);
 
+    // 2. argument 처리 
     argc = process_opt_args(argc, argv);
 
     if(psync) {
@@ -250,16 +253,19 @@ int main(int argc, char **argv) {
 
     if (argc > 1) { isClient = 1; }
 
-    // allocate dram region
-    if (allocate_physical_memory(BUFFER_SIZE) == NULL) {
+    // 3. allocate dram region
+    addr = allocate_physical_memory(BUFFER_SIZE);
+    if (addr == NULL) {
         fprintf(stderr, "Failed to allocate hugepage memory\n");
         return EXIT_FAILURE;
     }
 
-     // rdma connection (server & client)
-    init_rdma_agent(portno, regions, MR_COUNT, 2, NULL, NULL, NULL);
+     // 4. rdma connection (server & client)
+    init_rdma_agent(portno, regions, MR_COUNT, 2, isClient, NULL, NULL, NULL);
 
-    if (isClient) {
+    // 5. client or server 
+    if (isClient) { // client
+        printf("[Client] Connecting to %s\n", server_ip);
         int iters = atoi(argv[2]);
 
         if (iters > OFFLOAD_COUNT) {
@@ -269,7 +275,8 @@ int main(int argc, char **argv) {
         // sockfd를 반환
         master_sock = add_connection(server_ip, portno, SOCK_MASTER, 1, 0);
     } 
-    else {
+    else {          // server
+        printf("[Server] Listening on %s\n", portno);
         sleep(10);
        
         printf("---- Initializing array A ----\n");
@@ -279,8 +286,12 @@ int main(int argc, char **argv) {
 
     }
 
+    // 6. rc_ready() 호출 
+
+    // 7. mode-per connection (RedN)
 
     pthread_join(comm_thread, NULL);
+    free_physical_memory(addr, BUFFER_SIZE);
     printf("Agent thread terminated. Exiting main.\n");
 
 }
