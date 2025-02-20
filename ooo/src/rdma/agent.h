@@ -32,5 +32,6 @@ static void on_completion(struct ibv_wc *wc);
 
 static void* client_loop();
 static void* server_loop();
+static void* rdma_event_loop_thread(void *arg);
 
 #endif
