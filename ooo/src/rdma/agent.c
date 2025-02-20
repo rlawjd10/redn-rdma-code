@@ -26,9 +26,9 @@ void init_rdma_agent(char *listen_port, struct mr_context *regions,
 	if(region_count > MAX_MR)
 		rc_die("region count is greater than MAX_MR");
 
-	mrs = regions;
-	num_mrs = region_count;
-	msg_size = buffer_size;
+	mrs = regions;	// 2MB 
+	num_mrs = region_count;	// num_mrs = 2
+	msg_size = buffer_size;	// msg_size = 2
 
     // callback 함수 설정 
 	app_conn_event = app_connect;
@@ -73,6 +73,11 @@ int add_connection(char* ip, char *port, int app_type, int polling_loop, int fla
 
 	getaddrinfo(ip, port, NULL, &addr); 
 
+	// memset(&addr, 0, sizeof(addr));
+	// addr.sin_family = AF_INET;
+	// addr.sin_port = htons(atoi(port));
+	// addr.sin_addr.s_addr = inet_addr(ip);
+
 	rdma_create_event_channel();
 
 	rdma_create_id(ec, &cm_id, NULL, RDMA_PS_TCP);
@@ -92,7 +97,7 @@ static void on_pre_conn(struct rdma_cm_id *id)
 {
 	struct conn_context *ctx = (struct conn_context *)id->context;
     
-    debug_print("mrs: %p, num_mrs: %d, msg_size: %d\n", mrs, num_mrs, msg_size);
+    //debug_print("mrs: %p, num_mrs: %d, msg_size: %d\n", mrs, num_mrs, msg_size);
 	
 	mr_register(ctx, mrs, num_mrs, msg_size);
 }
@@ -149,9 +154,17 @@ static void* client_loop()
 {
 	printf("[RDMA-Client] Listening for incoming connections. interrupt (^C) to exit.\n");
 	rdma_event_loop(ec, 0, 1); /* exit upon disconnect */
+	
 	rdma_destroy_event_channel(ec);
 	debug_print("exiting rc_client_loop\n");
 	return NULL;
+}
+
+static void* rdma_event_loop_thread(void *arg)
+{
+    struct rdma_event_channel *ec = (struct rdma_event_channel *)arg;
+    rdma_event_loop(ec, 0, 0);
+    return NULL;
 }
 
 static void* server_loop(void *port)
@@ -170,10 +183,18 @@ static void* server_loop(void *port)
 
 	printf("[RDMA-Server] Listening on port %d for connections. interrupt (^C) to exit.\n", atoi(port));
 	
-	while (1) {
-		rdma_event_loop(ec, 0, 0); /* do not exit upon disconnect */
-		// 종료조건 -> main에서 SIGINT 발생시 종료 
-	}
+	pthread_t event_thread;
+	pthread_create(&event_thread, NULL, rdma_event_loop_thread, ec);
+	pthread_join(event_thread, NULL);
+	pthread_cancel(comm_thread);
+	printf("event thread terminated \n");
+
+	// while (1) {
+	// 	rdma_event_loop(ec, 0, 0); /* do not exit upon disconnect */
+	// 	// 종료조건 -> main에서 SIGINT 발생시 종료 
+	// }
+	// pthread_create(&comm_thread, NULL, rdma_event_loop, ec, 0, 0);
+
 
 	rdma_destroy_id(cm_id);
 	rdma_destroy_event_channel(ec);
@@ -182,3 +203,6 @@ static void* server_loop(void *port)
 
 	return 0;
 }
+
+
+
