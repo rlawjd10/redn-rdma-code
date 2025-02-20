@@ -100,8 +100,9 @@ int setup_connection(struct rdma_cm_id * id, struct rdma_conn_param * cm_params)
 
 	try_build_device(id);	// device 정보 조회 및 생성
 
+	// server
 #if 1	// rdma 연결 메타데이터 (private_data) 업데이트 및 원격 MR과 동기화
-	if(cm_params)
+	if(cm_params)	// client는 NULL, server는 param.conn 전달 
 		rc_meta = (struct rc_metadata *) cm_params->private_data;
 
 	// modify connection parameters using metadata exchanged between client and server
@@ -127,7 +128,6 @@ int setup_connection(struct rdma_cm_id * id, struct rdma_conn_param * cm_params)
 	if(rdma_create_qp(id, rc_get_pd(id), &qp_attr))
 		rc_die("queue pair creation failed");
 
-
 	/* MLX5 Direct Verbs를 사용하여 RDMA QP 초기화 */
 	// 즉, QP를 low-level hardware objects로 변환하여 direct verbs API에서 사용할 수 있도록 초기화
 	// rdma-core 보다 더 낮은 수준에서 QP를 직접 제어 -> 하드웨어 직접 접근
@@ -148,7 +148,6 @@ int setup_connection(struct rdma_cm_id * id, struct rdma_conn_param * cm_params)
 	else
 		ctx->sq_signal_bits = 0;	// CQ에 신호를 보내지 않고 송신 큐 요청만 처리
 
-	// update connection hash tables (RDMA QP 및 연결정보를 빠르게 검색하기 위한 해시 테이블)
 	struct id_record *entry = (struct id_record *)calloc(1, sizeof(struct id_record));
 	struct sockaddr_in *addr_p = copy_ipv4_sockaddr(&id->route.addr.src_storage);
 	
@@ -160,7 +159,7 @@ int setup_connection(struct rdma_cm_id * id, struct rdma_conn_param * cm_params)
 	entry->id = id;
 
 	//add the structure to both hash tables
-	// IP는 rdma_resolve_*를 통해 사용(서버 간 연결 수립립),  QP는 RDMA 연결 후에 RDMA 작업을 함 
+	// IP는 rdma_resolve_*를 통해 사용(서버 간 연결 수립),  QP는 RDMA 연결 후에 RDMA 작업을 함 
 	HASH_ADD(qp_hh, s_ctx->id_by_qp, qp_num, sizeof(uint32_t), entry);
 	HASH_ADD(addr_hh, s_ctx->id_by_addr, addr, sizeof(struct sockaddr_in), entry);
 }
@@ -259,7 +258,7 @@ void build_cq_channel(struct rdma_cm_id *id)
 
  	int ret = mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_CQ);
 
-	//printf("creating background thread to poll completions (blocking)\n");
+	printf("creating background thread to poll completions (blocking)\n");
 	
 	// CQ 이벤트 폴링하는 백그라운드 스레드 
 	pthread_create(&ctx->cq_poller_thread, NULL, poll_cq_blocking_loop, ctx);
@@ -289,12 +288,12 @@ void build_rc_params(struct rdma_cm_id *id, struct rdma_conn_param *params)
 
 	memset(params, 0, sizeof(*params));
 
-	params->initiator_depth = params->responder_resources = 1;
+	params->initiator_depth = params->responder_resources = 1; 	
 	params->rnr_retry_count = 7; /* infinite retry */
 
 	struct rc_metadata *meta = (struct rc_metadata *)calloc(1, sizeof(struct rc_metadata));
 
-	// 원격 MR 정보를 클라이언트 저장 
+	// MR 정보 교환을 위한 메타데이터 설정 
 	meta->flags = ctx->flags;
 	meta->type = ctx->app_type;
 	meta->mr_count = num_mrs;
@@ -319,8 +318,10 @@ void rdma_event_loop(struct rdma_event_channel *ec, int exit_on_connect, int exi
 	struct rdma_cm_event *event = NULL;
 	struct rdma_conn_param cm_params;
 
-	debug_print("Listening for incoming connections...\n");
-
+	if (!exit_on_connect) {
+		printf("Listening for incoming connections...\n");
+	}
+	
 	while (rdma_get_cm_event(ec, &event) == 0) {
 		struct rdma_cm_event event_copy;
 
@@ -677,6 +678,8 @@ struct rdma_cm_id* get_connection(int sockfd)	// sockfd를 통해 연결 찾기
 __attribute__((visibility ("hidden"))) // RDMA 연결 관리 모듈을 초기화 
 void rc_init(pre_conn_cb_fn pc, connect_cb_fn conn, completion_cb_fn comp, disconnect_cb_fn disc)
 {	
+	//debug_print("initializing RC module\n");
+
 	s_conn_bitmap = calloc(MAX_CONNECTIONS, sizeof(int));
 	s_conn_ids = (struct rdma_cm_id **)calloc(MAX_CONNECTIONS, sizeof(struct rdma_cm_id*));
 
