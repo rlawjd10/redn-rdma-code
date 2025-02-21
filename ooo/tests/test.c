@@ -11,19 +11,21 @@
 #include <inttypes.h>
 #include "agent.h"
 
+#define BUCKET_COUNT 2
+
 #define OFFLOAD_COUNT 50000
+
+#define IO_SIZE 65536   // 64KB
 
 #define BUFFER_SIZE (2 * 1024 * 1024)  // 2MB HugePage
 #define HUGEPAGE_PATH "/dev/hugepages" // HugePage 경로
 
-// SOCK_WORKER
 #define REDN_SINGLE 1
-//#define REDN_PARALLEL 1   // SOCK_CLIENT
-//#define REDN_SEQUENTIAL 1
+#define REDN_PARALLEL 1  
+#define REDN_SEQUENTIAL 1
 
 #define REDN defined(REDN_SINGLE) || defined(REDN_PARALLEL) || defined(REDN_SEQUENTIAL)
 
-// SOCK_MASTER
 //#define ONE_SIDED 1
 //#define TWO_SIDED 1
 
@@ -54,9 +56,9 @@ enum region_type {
 };
 
 enum sock_type {
-	SOCK_MASTER = 2,    // server
-	SOCK_CLIENT,        // client
-	SOCK_WORKER         // server에서 rdma 연산 수행 (확인필요)
+	SOCK_MASTER = 2,    
+	SOCK_CLIENT,        
+	SOCK_WORKER         
 };
 
 #define SHM_PATH "/ifbw_shm"
@@ -103,8 +105,6 @@ void destroy_shm(void *addr) {
 
 volatile sig_atomic_t stop = 0;
 
-struct mr_context regions[MR_COUNT];
-
 int batch_size = 1;	//default - batching disabled
 int sge_count = 1;	//default - 1 scatter/gather element
 int use_cas = 0;	//default - compare_and_swap disabled
@@ -114,14 +114,28 @@ int psync = 0;		// used for process synchronization
 char *portno = "12345";
 char *intf = "enp3s0f0";
 
-int master_sock = 0;
-int client_sock = 2;
-int worker_sock = 3;
+int isClient = 0;
 
+struct mr_context regions[MR_COUNT];
+
+static pthread_t offload_thread[BUCKET_COUNT];
+
+int master_sock = 0;
+int client_sock[BUCKET_COUNT] = {2, 3};
+int worker_sock[BUCKET_COUNT] = {4, 6};
+
+int thread_arg[BUCKET_COUNT] = {0, 0};
+
+int n_client = 0;
 
 pthread_spinlock_t sock_lock;
 
-int isClient = 0;
+int temp1_wrid[OFFLOAD_COUNT] = {0};
+int temp2_wrid[OFFLOAD_COUNT] = {0};
+
+// count the # of requests received from client
+volatile int n_hash_req = 0;
+
 typedef uintptr_t addr_t;
 
 uint64_t a[3] = {0, 1, 2};  
@@ -137,14 +151,13 @@ void *allocate_physical_memory(size_t size) {
             return NULL;
         }
         
-        // 메모리 락 (스왑 방지)
         if (mlock(addr, size) != 0) {
             perror("mlock failed");
             munmap(addr, size);
             return NULL;
         }
         
-        memset(addr, 0, size); // 초기화
+        memset(addr, 0, size); 
 
         regions[i].type = i;
         regions[i].length = size;
@@ -224,6 +237,126 @@ restart:
    return argc;
 }
 
+/* --- call back function --- */
+void add_peer_socket(int sockfd)
+{
+	int sock_type = rc_connection_meta(sockfd);
+
+	printf("ADDING PEER SOCKET %d (type: %d)\n", sockfd, sock_type);
+
+	if(isClient || sock_type != SOCK_CLIENT) { //XXX do not post receives on master socket
+		for(int i=0; i<100; i++) {
+			IBV_RECEIVE_IMM(sockfd);
+		}
+
+		return;
+	}
+
+#if defined(REDN)
+	pthread_spin_lock(&sock_lock);
+
+	int worker = add_connection(host, portno, SOCK_WORKER, 1, IBV_EXP_QP_CREATE_MANAGED_SEND);
+
+	int id = n_client++;
+
+	thread_arg[id] = id;
+
+	client_sock[id] = sockfd;
+	worker_sock[id] = worker;
+
+	printf("input id %d to offload_hash\n", id);
+
+	pthread_create(&offload_thread[id], NULL, offload_hash, &thread_arg[id]);
+
+	printf("Setting sockfds [client: %d worker: %d]\n", client_sock[id], worker_sock[id]);
+
+	pthread_spin_unlock(&sock_lock);
+#elif defined(TWO_SIDED)
+
+	client_sock[0] = sockfd;
+	addr_t base_addr = mr_local_addr(sockfd, MR_BUFFER);
+
+	// set up RECV for client inputs
+	struct rdma_metadata *recv_meta =  (struct rdma_metadata *)
+		calloc(1, sizeof(struct rdma_metadata) + 2 * sizeof(struct ibv_sge));
+
+	recv_meta->sge_entries[0].addr = base_addr;
+	recv_meta->sge_entries[0].length = 3;
+	recv_meta->sge_entries[1].addr = base_addr + 4;
+	recv_meta->sge_entries[1].length = 8;
+	recv_meta->length = 11;
+	recv_meta->sge_count = 2;
+
+	IBV_RECEIVE_SG(sockfd, recv_meta, mr_local_key(sockfd, MR_BUFFER));
+
+#endif
+	
+	return;
+}
+
+void test_callback(struct app_context *msg)
+{
+	//ibw_cpu_relax();
+	if(!isClient) {	
+
+		//printf("posting receive imm\n");
+		int sock_type = rc_connection_meta(msg->sockfd);
+
+		//XXX do not post receives on master lock socket
+		if(sock_type != SOCK_CLIENT)
+			IBV_RECEIVE_IMM(msg->sockfd);
+
+		if(sock_type == SOCK_CLIENT)
+			n_hash_req++;
+
+#if defined(REDN)
+		print_seg_data();
+
+#elif defined(TWO_SIDED)
+
+	int sockfd = msg->sockfd;
+	addr_t base_addr = mr_local_addr(sockfd, MR_BUFFER);
+	addr_t remote_addr = mr_remote_addr(sockfd, MR_BUFFER);
+
+
+	uint8_t *param1 = (uint8_t*) base_addr;
+	uint64_t *param2 = (uint64_t*)(base_addr + 4);
+
+	struct hash_bucket *bucket = (struct hash_bucket *) ntohll(*param2);
+
+	printf("received req: key %u addr %lu\n", param1[2], ntohll(*param2));
+	//printf("key required %u has %u\n", param1[2], bucket->key[0]);
+	if(param1[2] == bucket->key[0]) {
+		post_hash_response(sockfd, bucket, remote_addr, msg->id);
+		IBV_TRIGGER(master_sock, sockfd, 0);
+	}
+	else
+		printf("Key doesn't exist!\n");
+
+	// set up RECV for client inputs
+	struct rdma_metadata *recv_meta =  (struct rdma_metadata *)
+		calloc(1, sizeof(struct rdma_metadata) + 2 * sizeof(struct ibv_sge));
+
+	recv_meta->sge_entries[0].addr = base_addr;
+	recv_meta->sge_entries[0].length = 3;
+	recv_meta->sge_entries[1].addr = base_addr + 4;
+	recv_meta->sge_entries[1].length = 8;
+	recv_meta->length = 11;
+	recv_meta->sge_count = 2;
+
+	IBV_RECEIVE_SG(sockfd, recv_meta, mr_local_key(sockfd, MR_BUFFER));
+
+#endif
+
+	}
+	printf("Received response with id %d (n_req %d)\n", msg->id, n_hash_req);
+}
+
+void remove_peer_socket(int sockfd)
+{
+	;
+}
+
 
 int main(int argc, char **argv) {
 
@@ -261,7 +394,7 @@ int main(int argc, char **argv) {
     }
 
      // 4. rdma connection (server & client)
-    init_rdma_agent(portno, regions, MR_COUNT, 2, isClient, NULL, NULL, NULL);
+    init_rdma_agent(portno, regions, MR_COUNT, 2, isClient, add_peer_socket, remove_peer_socket, test_callback);
 
     // 5. client or server 
     if (isClient) { // client
