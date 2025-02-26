@@ -14,11 +14,11 @@ LDLIBS = -lrdma -lm -pthread -lrt
 LDFLAGS += -Wl,-rpath=$(abspath $(RDMA_DIR)) -L$(RDMA_DIR) 
 
 RM = rm -f 
-#DEPS = time_stat.c
+DEPS = time_stat.c
 #SRCS = rpc_client.c rpc_server.c cc_lat.c cc_bw.c if_lat.c if_bw.c calc_lat.c noop_lat.c atm_lat.c atm_bw.c write_lat.c write_bw.c read_lat.c loop_lat.c loop_bw.c hash_get.c fork_test.c lock_test.c chain_lat.c chain_bw.c if_cas_bw.c if_copy_bw.c hash_cas_bw.c hash_copy_bw.c test.c test2.c test3.c cqe_err.c example_test.c example_cas_test.c
 SRCS = test.c
 OBJS = $(SRCS:.c=.o)
-#OBJS += $(DEPS:.c=.o)
+OBJS += $(DEPS:.c=.o)
 BIN = $(SRCS:.c=)
 
 # 항상 실행되는 타겟 
@@ -30,7 +30,7 @@ all: $(BIN)
 
 # BIN 타겟 (빌드 규칙)
 $(BIN):$(OBJS)
-		$(CC) $(OBJS) ${LDFLAGS} ${LDLIBS} -o $@
+		$(CC) $@.o time_stat.o ${LDFLAGS} ${LDLIBS} -o $@
 
 %.o: %.c
 		$(CC) $(INCLUDES) -c $(CFLAGS) -o $@ $<
