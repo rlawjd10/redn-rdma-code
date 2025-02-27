@@ -311,7 +311,7 @@ int __mlx5_post_send(struct ibv_exp_send_wr *wr,
 	return 0;
 }
 
-// SEND WQE를 생성하여 NIC에 전송. (즉, ibw_post_send() 호출하는 래퍼 함수)
+// SEND WQE를 생성하여 NIC에 전송. (즉, ibv_post_send() 호출하는 래퍼 함수)
 int ibv_post_send_wrapper(struct conn_context *ctx, struct ibv_qp *qp, struct ibv_send_wr *wr,
 		                         struct ibv_send_wr **bad_wr)
 {
@@ -319,6 +319,15 @@ int ibv_post_send_wrapper(struct conn_context *ctx, struct ibv_qp *qp, struct ib
 	update_scur_post((struct ibv_exp_send_wr *)wr, ctx);    // WQE 크기 및 현재 queue 상태 최신으로 업데이트.
 #endif
 	return ibv_post_send(qp, wr, bad_wr);
+}
+
+int ibv_exp_post_send_wrapper(struct conn_context *ctx, struct ibv_qp *qp, struct ibv_exp_send_wr *wr,
+		struct ibv_exp_send_wr **bad_wr)
+{
+#ifndef MODDED_DRIVER
+	update_scur_post(wr, ctx);
+#endif
+	return ibv_exp_post_send(qp, wr, bad_wr);
 }
 
 
