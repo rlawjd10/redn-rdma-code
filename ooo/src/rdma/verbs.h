@@ -222,4 +222,8 @@ uint32_t send_message(struct rdma_cm_id *id, int buffer_id);
 void receive_message(struct rdma_cm_id *id, int buffer_id);
 void receive_imm(struct rdma_cm_id *id, int buffer_id);
 
+// EXP_VERBS
+uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count);
+
+
 #endif
