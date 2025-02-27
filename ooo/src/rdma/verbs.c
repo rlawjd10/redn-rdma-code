@@ -812,7 +812,7 @@ void receive_message(struct rdma_cm_id *id, int buffer)
 }
 
 __attribute__((visibility ("hidden"))) 
-void receive_imm(struct rdma_cm_id *id, int buffer)
+void receive_imm(struct rdma_cm_id *id, int buffer)	// two-sided rdma 
 {
 	struct conn_context *ctx = (struct conn_context *)id->context;
 
@@ -831,4 +831,39 @@ void receive_imm(struct rdma_cm_id *id, int buffer)
 	ibv_post_recv(id->qp, &wr, &bad_wr);
 }
 
+#ifdef EXP_VERBS
+uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count)
+{
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
 
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	/* SEND_EN (QP, beforecount) */
+	wr->wr_id = next_wr_id(mctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+	wr->ex.imm_data = 0;
+
+	wr->task.wqe_enable.qp = ctx->id->qp;
+	wr->task.wqe_enable.wqe_count = count;
+
+	debug_print("POST --> SEND_ENABLE(WR#%lu) [master = %d] [worker = %d]\n", wr[0].wr_id, msockfd, sockfd);
+
+	uint32_t wr_id = wr->wr_id;
+
+	int ret = ibv_exp_post_send_wrapper(mctx, mctx->id->qp, wr, &bad_wr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma wr");
+	}
+
+	return wr_id;
+}
+#endif
