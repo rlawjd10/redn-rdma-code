@@ -9,9 +9,11 @@
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <inttypes.h>
+#include "time_stat.h"
 #include "agent.h"
 
 #define BUCKET_COUNT 2
+#define HASH_SIZE 10
 
 #define OFFLOAD_COUNT 50000
 
@@ -21,13 +23,13 @@
 #define HUGEPAGE_PATH "/dev/hugepages" // HugePage 경로
 
 #define REDN_SINGLE 1
-#define REDN_PARALLEL 1  
-#define REDN_SEQUENTIAL 1
+//#define REDN_PARALLEL 1  
+//#define REDN_SEQUENTIAL 1
 
 #define REDN defined(REDN_SINGLE) || defined(REDN_PARALLEL) || defined(REDN_SEQUENTIAL)
 
-//#define ONE_SIDED 1
-//#define TWO_SIDED 1
+#define ONE_SIDED 1
+#define TWO_SIDED 1
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -56,9 +58,15 @@ enum region_type {
 };
 
 enum sock_type {
-	SOCK_MASTER = 2,    
-	SOCK_CLIENT,        
-	SOCK_WORKER         
+	SOCK_MASTER = 2,
+	SOCK_CLIENT,
+	SOCK_WORKER
+};
+
+struct __attribute__((__packed__)) hash_bucket {
+	uint8_t key[3];
+	uint64_t addr;
+	uint64_t value[32768]; //XXX inline values for now 
 };
 
 #define SHM_PATH "/ifbw_shm"
@@ -66,7 +74,7 @@ enum sock_type {
 
 #define LAT 1
 
-// 공유 메모리 설정 
+// shared memory  
 void* create_shm(int *fd, int *res) {
 	void * addr;
 	*fd = shm_open(SHM_PATH, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
@@ -117,6 +125,10 @@ char *intf = "enp3s0f0";
 int isClient = 0;
 
 struct mr_context regions[MR_COUNT];
+struct time_stats *timer;
+struct time_stats *timer_total;
+
+struct mr_context regions[MR_COUNT];
 
 static pthread_t offload_thread[BUCKET_COUNT];
 
@@ -137,8 +149,6 @@ int temp2_wrid[OFFLOAD_COUNT] = {0};
 volatile int n_hash_req = 0;
 
 typedef uintptr_t addr_t;
-
-uint64_t a[3] = {0, 1, 2};  
 
 /* --- allocate memory ---*/
 void *allocate_physical_memory(size_t size) {
@@ -237,6 +247,128 @@ restart:
    return argc;
 }
 
+/* --- post hash response (client) --- */
+uint32_t post_get_req_async(int sockfd, uint32_t key, addr_t addr, uint32_t imm, uint32_t offset)
+{
+	struct rdma_metadata *send_meta =  (struct rdma_metadata *)
+		calloc(1, sizeof(struct rdma_metadata) + 2 * sizeof(struct ibv_sge));
+
+	printf("--> Send GET [key %u addr %lu]\n", key, addr);
+
+	addr_t base_addr = mr_local_addr(sockfd, MR_BUFFER) + offset;
+	uint8_t *param1 = (uint8_t *) base_addr; //key
+	uint64_t *param2 = (uint64_t *) (base_addr + 4); //addr
+
+	param1[0] = 0;
+	param1[1] = 0;
+	param1[2] = key;
+	*param2 = htonll(addr);
+
+	send_meta->sge_entries[0].addr = (uintptr_t) param1;
+	send_meta->sge_entries[0].length = 3;
+	send_meta->sge_entries[1].addr = (uintptr_t) param2;
+	send_meta->sge_entries[1].length = 8;
+	send_meta->length = 11;
+	send_meta->sge_count = 2;
+	send_meta->addr = 0;
+	send_meta->imm = imm;
+	return IBV_WRAPPER_SEND_WITH_IMM_ASYNC(sockfd, send_meta, MR_BUFFER, 0);
+}
+
+void post_get_req_sync(int *socks, uint32_t key, addr_t addr, int response_id)
+{
+	struct timespec start, end;
+
+	addr_t base_addr = mr_local_addr(socks[0], MR_DATA);
+	volatile uint64_t *res = (volatile uint64_t *) (base_addr);
+
+#if REDN_PARALLEL
+
+	for(int h=0; h<BUCKET_COUNT; h++)
+		post_get_req_async(socks[h], key+h, addr + h*sizeof(struct hash_bucket), response_id, h*16);
+
+	time_stats_start(timer);
+
+	for(int h=0; h<BUCKET_COUNT; h++)
+		IBV_TRIGGER(master_sock, socks[h], 0);
+
+	time_stats_stop(timer);
+
+	time_stats_print(timer, "Run Complete");
+
+#elif defined(REDN_SEQUENTIAL)
+
+	for(int h=0; h<BUCKET_COUNT; h++) {
+		post_get_req_async(socks[0], key, addr + h*sizeof(struct hash_bucket), response_id + h, h*16);
+	}
+
+	time_stats_start(timer);
+
+	IBV_TRIGGER(master_sock, socks[0], 0);
+
+	IBV_AWAIT_RESPONSE(socks[0], response_id + BUCKET_COUNT - 1);
+
+	time_stats_stop(timer);
+
+	time_stats_print(timer, "Run Complete");
+
+#elif defined(ONE_SIDED)
+
+	volatile struct hash_bucket *bucket = NULL;
+	uint32_t wr_id = 0;
+	addr_t bucket_addr =  mr_remote_addr(socks[0], MR_DATA);
+
+	printf("--> Send GET [key %u addr %lu]\n", key, addr);
+
+	printf("read from remote addr %lu\n", bucket_addr);
+
+	rdma_meta_t *meta = (rdma_meta_t *) calloc(1, sizeof(rdma_meta_t))
+		+ 1 * sizeof(struct ibv_sge);
+
+	meta->addr = bucket_addr;
+	meta->length = 19 * 6;
+	meta->sge_count = 1;
+	meta->sge_entries[0].addr = base_addr;
+	meta->sge_entries[0].length = 19 * 6;
+	meta->next = NULL;
+
+	printf("reading from dst %lu to src %lu\n", bucket_addr, base_addr);
+	wr_id = IBV_WRAPPER_RDMA_READ_ASYNC(socks[0], meta, MR_DATA, MR_DATA);
+
+	IBV_TRIGGER(master_sock, socks[0], 0);
+
+	time_stats_start(timer);
+
+	IBV_AWAIT_WORK_COMPLETION(socks[0], wr_id);	// busy wait
+
+	bucket = (volatile struct hash_bucket *) base_addr;
+
+	if(bucket->key[0] == (uint8_t)key) {
+		printf("found key\n");
+		IBV_TRIGGER(master_sock, socks[0], 0);
+
+		printf("value size %u\n", res[IO_SIZE/8 - 1]);
+	}
+	else {
+		printf("didn't find key required %d. found %d \n", key, bucket->key[0]);
+	}
+
+	time_stats_stop(timer);
+
+#else	// two-sided 
+
+	post_get_req_async(socks[0], key, addr, response_id, 0);
+
+	time_stats_start(timer);
+
+	IBV_TRIGGER(master_sock, socks[0], 0);
+
+	time_stats_stop(timer);
+
+	time_stats_print(timer, "Run Complete");
+//#endif
+}
+
 /* --- call back function --- */
 void add_peer_socket(int sockfd)
 {
@@ -245,10 +377,12 @@ void add_peer_socket(int sockfd)
 	printf("ADDING PEER SOCKET %d (type: %d)\n", sockfd, sock_type);
 
 	if(isClient || sock_type != SOCK_CLIENT) { //XXX do not post receives on master socket
+	
+#if defined(TWO_SIDED)		
 		for(int i=0; i<100; i++) {
 			IBV_RECEIVE_IMM(sockfd);
 		}
-
+#endif
 		return;
 	}
 
@@ -296,7 +430,7 @@ void add_peer_socket(int sockfd)
 
 void test_callback(struct app_context *msg)
 {
-	//ibw_cpu_relax();
+	// server 
 	if(!isClient) {	
 
 		//printf("posting receive imm\n");
@@ -347,14 +481,13 @@ void test_callback(struct app_context *msg)
 	IBV_RECEIVE_SG(sockfd, recv_meta, mr_local_key(sockfd, MR_BUFFER));
 
 #endif
-
 	}
 	printf("Received response with id %d (n_req %d)\n", msg->id, n_hash_req);
 }
 
 void remove_peer_socket(int sockfd)
 {
-	;
+	debug_print("REMOVING PEER SOCKET %d\n", sockfd);
 }
 
 
@@ -363,14 +496,15 @@ int main(int argc, char **argv) {
     int shm_fd, shm_ret;
     char *server_ip = argv[1];
     void *addr;
+	uint32_t get_key;
 
-    // 1. timer 설정 
-    ////////////////
+    // 1. setting
+    timer = (struct time_stats*) malloc(sizeof(struct time_stats));
     int *shm_proc = (int*)create_shm(&shm_fd, &shm_ret);
 
     pthread_spin_init(&sock_lock, PTHREAD_PROCESS_PRIVATE);
 
-    // 2. argument 처리 
+    // 2. argument 
     argc = process_opt_args(argc, argv);
 
     if(psync) {
@@ -393,38 +527,74 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-     // 4. rdma connection (server & client)
+    // 4. rdma connection (server & client)
     init_rdma_agent(portno, regions, MR_COUNT, 2, isClient, add_peer_socket, remove_peer_socket, test_callback);
 
     // 5. client or server 
-    if (isClient) { // client
+    if (isClient) { 
         printf("[Client] Connecting to %s\n", server_ip);
         int iters = atoi(argv[2]);
 
         if (iters > OFFLOAD_COUNT) {
             return 1;
         }
+		time_stats_init(timer, iters);
         
-        // sockfd를 반환
+        // return sockfd
         master_sock = add_connection(server_ip, portno, SOCK_MASTER, 1, 0);
     } 
-    else {          // server
+    else {	// server
         printf("[Server] Listening on %s\n", portno);
-        sleep(10);
-       
-        printf("---- Initializing array A ----\n");
-        for (int i = 0; i < 3; i++) {
-            a[i] = i + 1000;
-        }
 
+        printf("---- Initializing hashmap ----\n");
+		addr_t addr = regions[MR_DATA].addr;
+        struct hash_bucket *bucket = (struct hash_bucket*)addr;
+
+		for (int i = 0; i < HASH_SIZE; i++)
+		{
+			bucket[i].key[0] = i;
+			bucket[i].addr = htobe64((uintptr_t)&bucket[i].value[0]);
+			bucket[i].value[0] = i;
+
+			printf("bucket[%d] key=%u addr=%lu\n", i, *((uint32_t *)bucket[i].key), be64toh(bucket[i].addr)); 
+		}
+		
+
+		pthread_join(comm_thread, NULL);
+    	free_physical_memory(addr, BUFFER_SIZE);
+    	printf("Agent thread terminated. Exiting main.\n");
+
+		return 0;
     }
 
-    // 6. rc_ready() 호출 
+	while(!(rc_ready(master_sock)) && !stop) {
+				asm("");
+	}
 
-    // 7. mode-per connection (RedN)
+    // 6. Run in client mode
+#if REDN_PARALLEL
+	for(int h=0; h<BUCKET_COUNT; h++) {
+		client_sock[h] = add_connection(argv[1], portno, SOCK_CLIENT, 1, IBV_EXP_QP_CREATE_MANAGED_SEND);
+	}
+#else
+	client_sock[0] = add_connection(argv[1], portno, SOCK_CLIENT, 1, IBV_EXP_QP_CREATE_MANAGED_SEND);
+#endif
 
-    pthread_join(comm_thread, NULL);
-    free_physical_memory(addr, BUFFER_SIZE);
-    printf("Agent thread terminated. Exiting main.\n");
+	printf("Starting benchmark ...\n");
 
+	int response_id = 1;
+	for(int i=0; i<iters; i++) {
+
+#if REDN_PARALLEL
+		for(int h=0; h<BUCKET_COUNT; h++)
+			IBV_RECEIVE_IMM(client_sock[h]);
+#else
+		IBV_RECEIVE_IMM(client_sock[0]);
+#endif
+	
+	get_key = rand() % HASH_SIZE;
+	post_get_req_sync(client_sock, get_key, mr_remote_addr(client_sock[0], MR_DATA), response_id);
+
+	}
+	time_stats_print(timer, "Run Complete");
 }
