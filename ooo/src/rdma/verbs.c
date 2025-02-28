@@ -595,7 +595,7 @@ void IBV_AWAIT_RESPONSE(int sockfd, uint32_t app_id)
 	struct rdma_cm_id *id = get_connection(sockfd);
 
 	debug_print("wait till response seqn = %u\n", app_id);
-	spin_till_response(id, app_id);
+	spin_till_response(id, app_id);	// busy-waiting
 	debug_print("wait ending. received response with seqn = %u\n", app_id);
 }
 
