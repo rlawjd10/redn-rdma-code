@@ -15,7 +15,7 @@
 #define BUCKET_COUNT 2
 #define HASH_SIZE 10
 
-#define OFFLOAD_COUNT 50000
+#define OFFLOAD_COUNT 5
 
 #define IO_SIZE 65536   // 64KB
 
@@ -418,7 +418,7 @@ void add_peer_socket(int sockfd)
 	if(isClient || sock_type != SOCK_CLIENT) { //XXX do not post receives on master socket
 	
 #if defined(TWO_SIDED)		
-		for(int i=0; i<100; i++) {
+		for(int i=0; i<10; i++) {
 			IBV_RECEIVE_IMM(sockfd);
 		}
 #endif
@@ -527,20 +527,82 @@ void remove_peer_socket(int sockfd)
 	debug_print("REMOVING PEER SOCKET %d\n", sockfd);
 }
 
-/* --- offload function --- */
+/* --- post hash response (server) --- */
+uint32_t post_hash_read(int sockfd, uint32_t lkey, uint32_t rkey)
+{
+	int src_mr = 0;
+	int dst_mr = 0;
+	int signaled = 1;
+
+	uint64_t remote_base_addr = mr_remote_addr(sockfd, dst_mr);
+	uint64_t local_base_addr = mr_local_addr(sockfd, src_mr);
+
+	struct ibv_send_wr *wr = malloc(sizeof(struct ibv_send_wr));
+	memset (wr, 0, sizeof (struct ibv_send_wr));
+
+	struct ibv_sge *sge = malloc(sizeof(struct ibv_sge) * 2);
+	memset(sge, 0, sizeof(struct ibv_sge) * 2);
+
+	sge[0].addr = local_base_addr;
+	sge[0].length = 3;
+	sge[0].lkey = lkey;
+	sge[1].addr = local_base_addr;
+	sge[1].length = 8;
+	sge[1].lkey = lkey;
+
+	/* prepare the send work request */
+	wr->next = NULL;
+	wr->wr_id = IBV_NEXT_WR_ID(sockfd);
+	wr->sg_list = sge;
+	wr->num_sge = 2;
+	wr->wr.rdma.remote_addr = remote_base_addr;
+	wr->wr.rdma.rkey = rkey;
+
+	wr->opcode = IBV_WR_RDMA_READ;
+	
+	if(signaled)
+		wr->send_flags = IBV_SEND_SIGNALED;
+
+	return IBV_POST_ASYNC(sockfd, wr);
+}
+
+uint32_t post_dummy_write(int sockfd, int iosize, int imm)
+{
+	// send response
+	int src_mr = 0;
+	int dst_mr = 0;
+
+	uint64_t remote_base_addr = mr_remote_addr(sockfd, dst_mr);
+	uint64_t local_base_addr = mr_local_addr(sockfd, src_mr);
+	rdma_meta_t *meta =  (rdma_meta_t *) malloc(sizeof(rdma_meta_t)
+			+ 1 * sizeof(struct ibv_sge));
+
+	meta->addr = remote_base_addr;
+	meta->length = iosize;
+	meta->sge_count = 1;
+	meta->sge_entries[0].addr = local_base_addr;
+	meta->sge_entries[0].length = iosize;
+	meta->imm = imm;
+	meta->next = NULL;
+
+	if(imm)
+		return IBV_WRAPPER_RDMA_WRITE_WITH_IMM_ASYNC(sockfd, meta, src_mr, dst_mr);
+	else
+		return IBV_WRAPPER_RDMA_WRITE_ASYNC(sockfd, meta, src_mr, dst_mr);
+}
+
+/* --- offload function (redn) --- */
 void * offload_hash(void *arg)
 {
-
 	struct timespec start, end;
 
 	int id = *((int *)arg);
-	int count = OFFLOAD_COUNT;
+	int count = OFFLOAD_COUNT; //50000
 
 	int master = master_sock;
 	int client = client_sock[id];
 	int worker = worker_sock[id];
 
-	//int sr0_wrid, sr1_wrid, sr2_wrid;
 	uint64_t base_data_addr = mr_local_addr(worker, MR_DATA);
 	uint64_t base_buffer_addr = mr_local_addr(worker, MR_BUFFER);
 
@@ -569,15 +631,14 @@ void * offload_hash(void *arg)
 		else
 			IBV_TRIGGER_EXPLICIT(worker, worker, count_1);
 
-		printf("remote start: %lu end: %lu\n", mr_remote_addr(worker, MR_DATA), mr_remote_addr(worker, MR_DATA) + mr_sizes[MR_DATA]);
-		sr0_wrid = post_hash_read(worker, client_wq_mr->lkey, mr_remote_key(worker, MR_DATA));
-
-		sr1_wrid = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), client_wq_mr->lkey, 1);
-	
-
 		IBV_WAIT_EXPLICIT(worker, worker, 1);
 
 		IBV_TRIGGER_EXPLICIT(worker, client, count_2);
+
+
+		sr0_wrid = post_hash_read(worker, client_wq_mr->lkey, mr_remote_key(worker, MR_DATA));
+
+		sr1_wrid = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), client_wq_mr->lkey, 1);
 		
 		sr2_wrid = post_dummy_write(client, IO_SIZE, k + 1);
 
@@ -586,8 +647,8 @@ void * offload_hash(void *arg)
 
 #if 1
 
+		// 1. find the control segment of the WR
 		// find READ WR
-		
 		sr0_ctrl = IBV_FIND_WQE(worker, sr0_wrid);
 
 		if(!sr0_ctrl) {
@@ -599,9 +660,6 @@ void * offload_hash(void *arg)
 		uint16_t idx0 =  ((sr0_meta >> 8) & (UINT_MAX));
 		uint8_t opmod0 = ((sr0_meta >> 24) & (UINT_MAX));
 		uint8_t opcode0 = (sr0_meta & USHRT_MAX);
-
-		//printf("sr0 (READ) segment will be posted to idx #%u\n", idx0);
-
 
 		// find CAS WR
 		sr1_ctrl = IBV_FIND_WQE(worker, sr1_wrid);
@@ -616,8 +674,6 @@ void * offload_hash(void *arg)
 		uint8_t opmod1 = ((sr1_meta >> 24) & (UINT_MAX));
 		uint8_t opcode1 = (sr1_meta & USHRT_MAX);
 
-		//printf("sr1 (CAS) segment will be posted to idx #%u\n", idx1);
-
 		// find WRITE WR
 		sr2_ctrl = IBV_FIND_WQE(client, sr2_wrid);
 
@@ -630,10 +686,8 @@ void * offload_hash(void *arg)
 		uint16_t idx2 =  ((sr2_meta >> 8) & (UINT_MAX));
 		uint8_t opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
 		uint8_t opcode2 = (sr2_meta & USHRT_MAX);
-
-		//printf("sr2 (WRITE) segment will be posted to idx #%u\n", idx2);
-
-
+		
+		// 2. find the data segment of the WR
 		void *seg0 = ((void*)sr0_ctrl) + sizeof(struct mlx5_wqe_ctrl_seg) + sizeof(struct mlx5_wqe_raddr_seg);
 
 		// need to modify 2 sges
@@ -668,6 +722,7 @@ void * offload_hash(void *arg)
 
 		sr2_data = (struct mlx5_wqe_data_seg *) seg2; 
 
+		// 3. modify the data segment of the READ WR
 		//XXX uncomment temporarily
 		sr0_data[0]->addr = htobe64(((uintptr_t) (&sr2_ctrl->qpn_ds)));
 		sr0_data[1]->addr = htobe64(((uintptr_t) (&sr2_data->addr)));
@@ -690,7 +745,7 @@ void * offload_hash(void *arg)
 		sr1_raddr->raddr = htobe64((uintptr_t) &sr2_ctrl->opmod_idx_opcode);
 		sr1_atomic->compare = htobe64(*((uint64_t *)&sr2_ctrl->opmod_idx_opcode));
 		
-		// set up RECV for client inputs
+		// 4. set up RECV for client inputs
 		struct rdma_metadata *recv_meta =  (struct rdma_metadata *)
 			calloc(1, sizeof(struct rdma_metadata) + 2 * sizeof(struct ibv_sge));
 
@@ -702,7 +757,6 @@ void * offload_hash(void *arg)
 		recv_meta->sge_count = 2;
 
 		IBV_RECEIVE_SG(client, recv_meta, worker_wq_mr->lkey);
-
 
 #endif
 	
