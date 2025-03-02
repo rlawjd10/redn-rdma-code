@@ -1005,20 +1005,10 @@ uint32_t IBV_WAIT_EXPLICIT(int msockfd, int sockfd, uint32_t count)
 	wr->sg_list = NULL;
 	wr->num_sge = 0;
 	wr->exp_opcode = IBV_EXP_WR_CQE_WAIT;
-#if 0
-	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EXPLICIT;
-#endif
-	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;// | IBV_EXP_SEND_SIGNALED;
 	wr->ex.imm_data = 0;
 	wr->task.cqe_wait.cq = ctx->cq;
-
-#if 0
-	wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
-#else
 	wr->task.cqe_wait.cq_count = count;
 	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
-#endif
-
 
 	debug_print("POST --> WAIT (SEND WR #%lu) [send_fd:%d wait_fd:%d wait_idx:%d]\n",
 			wr[0].wr_id, msockfd, sockfd, wr->task.cqe_wait.cq_count);
