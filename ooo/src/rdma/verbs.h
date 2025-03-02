@@ -166,7 +166,7 @@ static inline uint32_t next_wr_id(struct conn_context *ctx, int send)
 
 // wr id 생성 및 wqe 반환 
 uint32_t IBV_NEXT_WR_ID(int sockfd);
-//uint32_t IBV_NEXT_WR_IDX(int sockfd, int inc);
+uint32_t IBV_NEXT_WR_IDX(int sockfd, int inc);
 struct ibv_cq * IBV_GET_CQ(int sockfd);
 struct wqe_ctrl_seg * IBV_FIND_WQE(int sockfd, uint32_t wr_id);
 struct wqe_ctrl_seg * IBV_GET_WQE(int sockfd, uint32_t idx);
@@ -223,7 +223,20 @@ void receive_message(struct rdma_cm_id *id, int buffer_id);
 void receive_imm(struct rdma_cm_id *id, int buffer_id);
 
 // EXP_VERBS
+// wr creations
+struct ibv_exp_send_wr * ibv_create_exp_wait_wr(int sendQ, int listenQ, int n_wait, int last);
+struct ibv_exp_send_wr * ibv_create_exp_send_wr(int sendQ, int opcode, int local, int remote, addr_t size);
+
+uint32_t IBV_CALC_OP_ASYNC(int sockfd, rdma_meta_t *meta, int local_id, int remote_id, int opcode);
+void IBV_CALC_OP_SYNC(int sockfd, rdma_meta_t *meta, int local_id, int remote_id, int opcode);
+uint32_t IBV_WAIT(int msockfd, int sockfd);
+uint32_t IBV_WAIT_TILL(int msockfd, int sockfd, uint32_t count);
+uint32_t IBV_WAIT_EXPLICIT(int msockfd, int sockfd, uint32_t count);
 uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count);
+uint32_t IBV_TRIGGER_EXPLICIT(int msockfd, int sockfd, int count);
+void IBV_SET_TRIGGER(int msockfd, int sockfd, int ntriggers, int nwait);
+
+
 
 
 #endif
