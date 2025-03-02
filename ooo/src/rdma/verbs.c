@@ -832,7 +832,76 @@ void receive_imm(struct rdma_cm_id *id, int buffer)	// two-sided rdma
 }
 
 #ifdef EXP_VERBS
-uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count)
+uint32_t IBV_CALC_OP_ASYNC(int sockfd, rdma_meta_t *meta, int local_id, int remote_id, int opcode)
+{
+	int ret = 0;
+	struct ibv_exp_send_wr sr;
+	struct ibv_exp_send_wr *bad_sr;
+	struct ibv_sge *sge;
+
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;
+
+	struct ibv_mr *local_mr = ctx->local_mr[local_id];
+	struct mr_context *remote_mr = ctx->remote_mr[remote_id];
+
+
+	for(int i=0; i<meta->sge_count; i++) {
+		// FIXME: no idea why the length has to be 16
+		//meta->sge_entries[i].length = sizeof(uint64_t) + 8;
+		meta->sge_entries[i].lkey = local_mr->lkey;
+	}
+
+
+
+	/* prepare the send work request */
+	memset (&sr, 0, sizeof (sr));
+	sr.next = NULL;
+	sr.wr_id = next_wr_id(ctx, 1);
+	sr.exp_opcode = IBV_EXP_WR_RDMA_WRITE;
+	//sr.ex.imm_data = NULL;
+
+	//sr.exp_opcode = IBV_EXP_WR_SEND;
+
+	//sr.exp_opcode = IBV_EXP_WR_RDMA_WRITE_WITH_IMM;
+	//sr.ex.imm_data = 10;
+
+	sr.sg_list = meta->sge_entries;
+	sr.num_sge = meta->sge_count;
+	sr.wr.rdma.remote_addr = meta->addr;
+	sr.wr.rdma.rkey = remote_mr->rkey;
+	sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+#if 1
+	sr.exp_send_flags |= IBV_EXP_SEND_WITH_CALC;
+
+	sr.op.calc.calc_op   = opcode;
+	sr.op.calc.data_type = IBV_EXP_CALC_DATA_TYPE_UINT;
+	sr.op.calc.data_size = IBV_EXP_CALC_DATA_SIZE_64_BIT;
+#endif
+	ctx->n_posted_ops++;
+
+	uint32_t sr_id = sr.wr_id;
+	debug_print("POST --> CALC (SEND WR %u) [calc_op %d remote_addr %lx qp_num %u]\n",
+			sr_id, sr.op.calc.calc_op, meta->addr, ctx->id->qp->qp_num);
+	for(int i=0; i<sr.num_sge; i++)
+		debug_print("----------- sge%d [addr %lx, length %u]\n", i, sr.sg_list[i].addr, sr.sg_list[i].length);
+
+	ret = ibv_exp_post_send_wrapper(ctx, ctx->id->qp, &sr, &bad_sr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma operation");
+	}
+
+	return sr_id;
+}
+
+void IBV_CALC_OP_SYNC(int sockfd, rdma_meta_t *meta, int local_id, int remote_id, int opcode)
+{
+	uint32_t wr_id = IBV_CALC_OP_ASYNC(sockfd, meta, local_id, remote_id, opcode);
+	spin_till_completion(get_connection(sockfd), wr_id);
+}
+
+uint32_t IBV_WAIT(int msockfd, int sockfd)
 {
 	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
 	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
@@ -846,8 +915,238 @@ uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count)
 	wr->next = NULL;
 	wr->sg_list = NULL;
 	wr->num_sge = 0;
-	wr->exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	wr->exp_opcode = IBV_EXP_WR_CQE_WAIT;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;// | IBV_EXP_SEND_SIGNALED;
+	wr->ex.imm_data = 0;
+	wr->task.cqe_wait.cq = ctx->cq;
+
+#if 1
+	wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
+#else
+	
+	wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+	
+	//wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
+	//wr->exp_send_flags = IBV_EXP_SEND_SIGNALED;
+	ctx->n_posted_ops++;
+	
+#endif
+
+
+	debug_print("POST --> WAIT (SEND WR #%lu) [send_fd:%d wait_fd:%d wait_idx:%d]\n",
+			wr[0].wr_id, msockfd, sockfd, wr->task.cqe_wait.cq_count);
+
+	uint32_t wr_id = wr->wr_id;
+	int ret = ibv_exp_post_send_wrapper(mctx, mctx->id->qp, wr, &bad_wr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma wr");
+	}
+
+	return wr_id;
+}
+
+
+uint32_t IBV_WAIT_TILL(int msockfd, int sockfd, uint32_t count)
+{
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	/* SEND_EN (QP, beforecount) */
+	wr->wr_id = next_wr_id(mctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_CQE_WAIT;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;// | IBV_EXP_SEND_SIGNALED;
+	wr->ex.imm_data = 0;
+	wr->task.cqe_wait.cq = ctx->cq;
+
+#if 0
+	wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
+#else
+	wr->task.cqe_wait.cq_count = ctx->n_posted_ops + count;
 	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+#endif
+
+
+	debug_print("POST --> WAIT (SEND WR #%lu) [send_fd:%d wait_fd:%d wait_idx:%d]\n",
+			wr[0].wr_id, msockfd, sockfd, wr->task.cqe_wait.cq_count);
+
+	uint32_t wr_id = wr->wr_id;
+	int ret = ibv_exp_post_send_wrapper(mctx, mctx->id->qp, wr, &bad_wr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma wr");
+	}
+
+	return wr_id;
+}
+
+uint32_t IBV_WAIT_EXPLICIT(int msockfd, int sockfd, uint32_t count)
+{
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	/* SEND_EN (QP, beforecount) */
+	wr->wr_id = next_wr_id(mctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_CQE_WAIT;
+#if 0
+	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EXPLICIT;
+#endif
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;// | IBV_EXP_SEND_SIGNALED;
+	wr->ex.imm_data = 0;
+	wr->task.cqe_wait.cq = ctx->cq;
+
+#if 0
+	wr->task.cqe_wait.cq_count = ctx->n_posted_ops;
+#else
+	wr->task.cqe_wait.cq_count = count;
+	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+#endif
+
+
+	debug_print("POST --> WAIT (SEND WR #%lu) [send_fd:%d wait_fd:%d wait_idx:%d]\n",
+			wr[0].wr_id, msockfd, sockfd, wr->task.cqe_wait.cq_count);
+
+	uint32_t wr_id = wr->wr_id;
+
+	int ret = ibv_exp_post_send_wrapper(mctx, mctx->id->qp, wr, &bad_wr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma wr");
+	}
+
+	return wr_id;
+}
+
+struct ibv_exp_send_wr * ibv_create_exp_wait_wr(int sendQ, int listenQ, int n_wait, int last)
+{
+	struct conn_context *sctx = (struct conn_context *)get_connection(sendQ)->context;
+	struct conn_context *lctx = (struct conn_context *)get_connection(listenQ)->context;	
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	wr->wr_id = next_wr_id(sctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_CQE_WAIT;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;// | IBV_EXP_SEND_SIGNALED;
+	if(last)
+		wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+
+	wr->ex.imm_data = 0;
+	wr->task.cqe_wait.cq = lctx->cq;
+	if(n_wait)
+		wr->task.cqe_wait.cq_count = n_wait;
+	else
+		wr->task.cqe_wait.cq_count = lctx->n_posted_ops;
+	
+	return wr;
+}
+
+struct ibv_exp_send_wr * ibv_create_exp_send_wr(int sendQ, int opcode, int local, int remote, addr_t size)
+{
+	struct conn_context *sctx = (struct conn_context *)get_connection(sendQ)->context;
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	struct ibv_sge sge;
+	memset(&sge, 0, sizeof(struct ibv_sge));
+	sge.addr = (uintptr_t) mr_local_addr(sendQ, local);
+	sge.length = size;
+	sge.lkey = mr_local_key(sendQ, local);
+
+	wr->wr_id = next_wr_id(sctx, 1);
+	wr->next = NULL;
+	wr->sg_list = &sge;
+	wr->num_sge = 1;
+	wr->exp_opcode = opcode;
+	wr->wr.rdma.remote_addr = (uintptr_t) mr_remote_addr(sendQ, remote);
+	wr->wr.rdma.rkey = mr_remote_key(sendQ, remote);
+	wr->ex.imm_data = 0;
+	wr->exp_send_flags = IBV_EXP_SEND_SIGNALED;
+
+	return wr;
+}
+
+uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count)
+{
+#if 0
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_task task[1];
+	struct ibv_exp_task *task_bad;
+	struct ibv_exp_send_wr wr[1];
+
+	memset(task, 0, sizeof(*task) * 1);
+	memset(wr, 0, sizeof(*wr) * 1);
+
+	task[0].task_type = IBV_EXP_TASK_SEND;
+	task[0].item.qp = mctx->id->qp;
+	task[0].item.send_wr = wr;
+
+	task[0].next = NULL;
+
+	/* SEND_EN (QP, beforecount) */
+	wr[0].wr_id = next_wr_id(mctx, 1);
+	wr[0].next = NULL;
+	wr[0].sg_list = NULL;
+	wr[0].num_sge = 0;
+	wr[0].exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	wr[0].exp_send_flags = IBV_EXP_SEND_SIGNALED | IBV_EXP_SEND_WAIT_EN_LAST;
+	wr[0].ex.imm_data = 0;
+
+	wr[0].task.wqe_enable.qp = ctx->id->qp;
+	wr[0].task.wqe_enable.wqe_count = count;
+
+	debug_print("POST --> TASK(EN WR#%lu) [master = %d] [worker = %d]\n", wr[0].wr_id, msockfd, sockfd);
+
+	int ret = ibv_exp_post_task(rc_get_context(ctx->devid), task, &task_bad);
+
+	if(ret) {
+		printf("ibv_exp_post_task: errno = %d\n", ret);
+		rc_die("failed to post rdma task");
+	}
+#else
+
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	/* SEND_EN (QP, beforecount) */
+	wr->wr_id = next_wr_id(mctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	//wr->exp_send_flags = IBV_EXP_SEND_SIGNALED | IBV_EXP_SEND_WAIT_EN_LAST;
+	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EXPLICIT;
 	wr->ex.imm_data = 0;
 
 	wr->task.wqe_enable.qp = ctx->id->qp;
@@ -865,5 +1164,154 @@ uint32_t IBV_TRIGGER(int msockfd, int sockfd, int count)
 	}
 
 	return wr_id;
+#endif
+
 }
+
+uint32_t IBV_NEXT_WR_IDX(int sockfd, int pos)
+{
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;
+	return get_wr_idx(ctx, pos);
+}
+
+uint32_t IBV_TRIGGER_EXPLICIT(int msockfd, int sockfd, int count)
+{
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_send_wr *bad_wr = NULL;
+	struct ibv_exp_send_wr *wr = (struct ibv_exp_send_wr*) malloc(sizeof(struct ibv_exp_send_wr));
+	memset(wr, 0, sizeof(struct ibv_exp_send_wr));
+
+	/* SEND_EN (QP, beforecount) */
+	wr->wr_id = next_wr_id(mctx, 1);
+	wr->next = NULL;
+	wr->sg_list = NULL;
+	wr->num_sge = 0;
+	wr->exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	//wr->exp_send_flags = IBV_EXP_SEND_SIGNALED | IBV_EXP_SEND_WAIT_EN_LAST;
+	//wr->exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+#ifdef MODDED_DRIVER
+	wr->exp_send_flags = IBV_EXP_SEND_WAIT_EXPLICIT;
+#endif
+	wr->ex.imm_data = 0;
+
+	wr->task.wqe_enable.qp = ctx->id->qp;
+
+#ifdef MODDED_DRIVER
+	wr->task.wqe_enable.wqe_count = count;
+#else
+	wr->task.wqe_enable.wqe_count = 0;
+#endif
+
+	debug_print("POST --> SEND_ENABLE(WR#%lu) [master = %d] [worker = %d] [idx = %d]\n", wr[0].wr_id, msockfd, sockfd, count);
+
+	uint32_t wr_id = wr->wr_id;
+
+	int ret = ibv_exp_post_send_wrapper(mctx, mctx->id->qp, wr, &bad_wr);
+
+	if(ret) {
+		printf("ibv_exp_post_send_wrapper: errno = %d\n", ret);
+		rc_die("failed to post rdma wr");
+	}
+
+#ifndef MODDED_DRIVER
+	struct wqe_ctrl_seg *sr_ctrl = IBV_FIND_WQE(msockfd, wr_id);
+	void *seg = ((void*)sr_ctrl) + sizeof(struct mlx5_wqe_ctrl_seg);
+
+	struct wqe_wait_en_seg *sr_en_wait = (struct wqe_wait_en_seg *) seg;
+	sr_en_wait->pi = htonl(count);
+#endif
+
+	return wr_id;
+}
+
+void IBV_SET_TRIGGER(int msockfd, int sockfd, int nops, int nwait)
+{
+
+	struct conn_context *mctx = (struct conn_context *)get_connection(msockfd)->context;
+	struct conn_context *ctx = (struct conn_context *)get_connection(sockfd)->context;	
+
+	struct ibv_exp_task task[1];
+	struct ibv_exp_task *task_bad;
+
+	int n = 2 * nops - 1;
+	struct ibv_exp_send_wr wr[n];
+
+	memset(task, 0, sizeof(*task) * 1);
+	memset(wr, 0, sizeof(*wr) * n);
+
+	task[0].task_type = IBV_EXP_TASK_SEND;
+	task[0].item.qp = mctx->id->qp;
+	task[0].item.send_wr = wr;
+
+	task[0].next = NULL;
+
+	/* SEND_EN (QP, beforecount) */
+	wr[0].wr_id = next_wr_id(mctx, 1);
+	wr[0].next = n > 1 ? &wr[1] : NULL;
+	//debug_print("Check next: %p\n", wr[0].next);
+	wr[0].sg_list = NULL;
+	wr[0].num_sge = 0;
+	wr[0].exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+	//wr[0].exp_send_flags = IBV_EXP_SEND_SIGNALED;
+	//wr[0].exp_send_flags = (n == 1 ? IBV_EXP_SEND_WAIT_EN_LAST : 0);
+	wr[0].exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+	wr[0].ex.imm_data = 0;
+
+	wr[0].task.wqe_enable.qp = ctx->id->qp;
+	wr[0].task.wqe_enable.wqe_count = nwait;
+
+	for(int i=1; i<n; i+=2)
+	{
+		/* WAIT (QP, 1) */
+		wr[i].wr_id	= next_wr_id(mctx, 1);
+		wr[i].next = &wr[i+1];
+		wr[i].sg_list    = NULL;
+		wr[i].num_sge    = 0;
+		wr[i].exp_opcode = IBV_EXP_WR_CQE_WAIT;
+		//wr[i].exp_send_flags = IBV_EXP_SEND_SIGNALED;
+		//wr[i].exp_send_flags = (i == n-2 ? IBV_EXP_SEND_WAIT_EN_LAST : 0);
+		wr[i].exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+		wr[i].ex.imm_data = 0;
+		wr[i].task.cqe_wait.cq = ctx->cq;
+		wr[i].task.cqe_wait.cq_count = nwait;
+
+		/* SEND_EN (QP, aftercount) */
+		wr[i+1].wr_id = next_wr_id(mctx, 1);
+		wr[i+1].next = i < n-2 ? &wr[i+2] : NULL;
+		wr[i+1].sg_list = NULL;
+		wr[i+1].num_sge = 0;
+		wr[i+1].exp_opcode = IBV_EXP_WR_SEND_ENABLE;
+		//wr[i+1].exp_send_flags = IBV_EXP_SEND_SIGNALED;
+		//wr[i+1].exp_send_flags = (i == n-2 ? IBV_EXP_SEND_WAIT_EN_LAST : 0);
+		wr[i+1].exp_send_flags = IBV_EXP_SEND_WAIT_EN_LAST;
+		wr[i+1].ex.imm_data = 0;
+
+		wr[i+1].task.wqe_enable.qp = ctx->id->qp;
+		wr[i+1].task.wqe_enable.wqe_count = nwait;
+	}
+
+#ifdef DEBUG
+	debug_print("POST --> TASK (COUNT = %d) [master = %d] [worker = %d]\n",
+			n, msockfd, sockfd);
+	for(int i=0; i<n; i++) {
+		addr_t n_wr_id = wr[i].next != NULL ? wr[i].next->wr_id : 0;
+		if(wr[i].exp_opcode == IBV_EXP_WR_CQE_WAIT)
+			debug_print("------------ WAIT (WR# %lu) [flags: %lu next: %lu]\n",
+					wr[i].wr_id, wr[i].exp_send_flags, n_wr_id);
+		else
+			debug_print("------------ SEND_ENABLE (WR# %lu) [flags: %lu next: %lu]\n",
+					wr[i].wr_id, wr[i].exp_send_flags, n_wr_id);
+	}
+#endif
+
+	int ret = ibv_exp_post_task(rc_get_context(ctx->devid), task, &task_bad);
+
+	if(ret) {
+		printf("ibv_exp_post_task: errno = %d\n", ret);
+		rc_die("failed to post rdma task");
+	}		
+}
+
 #endif
